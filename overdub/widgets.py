@@ -44,6 +44,7 @@ class TimelineState(QObject):
         self.sel_track: str | None = None
         self.playhead: int | None = None
         self.loop = False
+        self.drag: tuple[str, int, int, int, bool] | None = None   # (track id, a, b, dst, copy) while moving
 
     def x_to_s(self, x: float) -> int:
         return int(round((self.offset + x / self.pps) * SR))
@@ -173,6 +174,7 @@ def _wheel(st: TimelineState, e) -> bool:
 class Lane(QWidget):
     pressed = Signal(str)                 # track id
     context = Signal(str, object)         # track id, global pos
+    moveRequested = Signal(str, int, int, int, bool)   # track id, a, b, dst, copy
 
     def __init__(self, track: Track, state: TimelineState, peaks: PeakCache, engine_ref):
         super().__init__()
@@ -182,8 +184,9 @@ class Lane(QWidget):
         self.engine_ref = engine_ref     # callable -> (engine, rec_track_id, live_peaks, latency)
         self.setFixedHeight(LANE_H)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        self.setMouseTracking(False)
+        self.setMouseTracking(True)
         self._drag_from: int | None = None
+        self._move: dict | None = None
         state.changed.connect(self.update)
 
     def paintEvent(self, _):
@@ -238,6 +241,21 @@ class Lane(QWidget):
             p.fillRect(QRectF(a, 0, max(0, st.s_to_x(eng.pos - lat) - a), h - 1), QColor(255, 60, 60, 35))
             self._draw_wave(p, cols, mid, amp, QColor("#ff5c5c"))
 
+        if st.drag and st.drag[0] == t.id and pk is not None:
+            _, a, b, dst, copy = st.drag
+            if not copy:   # source will become silence
+                xa, xb = st.s_to_x(a), st.s_to_x(b)
+                p.fillRect(QRectF(xa, 0, xb - xa, h - 1), QColor(0, 0, 0, 110))
+            xa, xb = st.s_to_x(dst), st.s_to_x(dst + b - a)
+            p.fillRect(QRectF(xa, 0, xb - xa, h - 1), QColor(30, 32, 40, 230))
+            spp = SR / st.pps
+            cols, _ = column_peaks(pk, st.offset * SR - (dst - a) - off_px * spp, spp, w)
+            xs = np.arange(w)
+            cols = np.where((xs >= xa) & (xs < xb), cols, 0)
+            self._draw_wave(p, cols, mid, amp, QColor(color).lighter(130))
+            p.setPen(QPen(QColor("#ffffff"), 1, Qt.DashLine))
+            p.drawRect(QRectF(xa, 1, xb - xa, h - 3))
+
         p.setPen(QColor(255, 255, 255, 60))
         p.setFont(QFont("Sans", 8))
         if t.offset_ms:
@@ -257,13 +275,24 @@ class Lane(QWidget):
         p.drawLine(QPointF(0, mid), QPointF(len(cols), mid))
 
     # interactions
+    def _in_selection(self, x: float) -> bool:
+        st = self.state
+        return (st.sel is not None and st.sel_track == self.track.id and self.track.audio is not None
+                and st.s_to_x(st.sel[0]) <= x <= st.s_to_x(st.sel[1]))
+
     def mousePressEvent(self, e):
         st = self.state
         if e.button() == Qt.RightButton:
             self.pressed.emit(self.track.id)
             self.context.emit(self.track.id, e.globalPosition().toPoint())
             return
-        s = max(0, min(st.length, st.x_to_s(e.position().x())))
+        x = e.position().x()
+        s = max(0, min(st.length, st.x_to_s(x)))
+        if (e.button() == Qt.LeftButton and not e.modifiers() & Qt.ShiftModifier
+                and self._in_selection(x)):
+            # grab the selection: dragging moves it (Ctrl: copies), a plain click just sets the cursor
+            self._move = {"x": x, "grab": s - st.sel[0], "moving": False}
+            return
         if e.modifiers() & Qt.ShiftModifier and st.sel_track == self.track.id:
             anchor = st.sel[0] if st.sel else st.cursor
             a, b = sorted((anchor, s))
@@ -277,10 +306,24 @@ class Lane(QWidget):
         st.changed.emit()
 
     def mouseMoveEvent(self, e):
-        if self._drag_from is None:
-            return
         st = self.state
-        s = max(0, min(st.length, st.x_to_s(e.position().x())))
+        x = e.position().x()
+        if self._move is not None:
+            if not self._move["moving"] and abs(x - self._move["x"]) < 4:
+                return
+            self._move["moving"] = True
+            a, b = st.sel
+            dst = st.x_to_s(x) - self._move["grab"]
+            dst = max(0, min(st.length - (b - a), dst))
+            st.drag = (self.track.id, a, b, dst, bool(e.modifiers() & Qt.ControlModifier))
+            self.setCursor(Qt.ClosedHandCursor)
+            st.changed.emit()
+            return
+        if self._drag_from is None:
+            if not e.buttons():
+                self.setCursor(Qt.OpenHandCursor if self._in_selection(x) else Qt.ArrowCursor)
+            return
+        s = max(0, min(st.length, st.x_to_s(x)))
         a, b = sorted((self._drag_from, s))
         if st.s_to_x(b) - st.s_to_x(a) >= 3:
             st.sel = (a, b)
@@ -289,6 +332,20 @@ class Lane(QWidget):
 
     def mouseReleaseEvent(self, e):
         self._drag_from = None
+        st = self.state
+        if self._move is not None:
+            mv, self._move = self._move, None
+            if mv["moving"] and st.drag:
+                tid, a, b, dst, copy = st.drag
+                st.drag = None
+                if dst != a:
+                    self.moveRequested.emit(tid, a, b, dst, copy)
+            else:
+                st.cursor = max(0, min(st.length, st.x_to_s(e.position().x())))
+                st.sel = None
+                self.pressed.emit(self.track.id)
+            self.setCursor(Qt.ArrowCursor)
+            st.changed.emit()
 
     def mouseDoubleClickEvent(self, e):
         self.state.sel = (0, self.state.length)

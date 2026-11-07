@@ -1,6 +1,7 @@
 """Main window: transport, effects panel, video preview, multitrack timeline."""
 from __future__ import annotations
 
+import json
 import os
 import re
 import subprocess
@@ -20,7 +21,7 @@ from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, Q
 
 from . import engine as eng
 from . import media
-from .dialogs import AudioSettingsDialog, ExportDialog, ShortcutsDialog
+from .dialogs import AudioSettingsDialog, ExportDialog, ShortcutsDialog, LatencyDialog
 from .fx import render_mix
 from .fx_panel import FxPanel
 from .project import SR, Project, Track, TRACK_COLORS
@@ -28,7 +29,6 @@ from .widgets import (TimelineState, PeakCache, Ruler, Lane, TrackHeader, Meter,
                       HEADER_W, PEAK_BIN, fmt_time, _nofocus)
 
 PROJECTS_DIR = os.path.expanduser("~/Overdub")
-PREROLL_S = 2.0
 VIDEO_EXTS = "Videos (*.mp4 *.mov *.MP4 *.MOV *.m4v *.mkv *.webm *.3gp)"
 
 
@@ -276,6 +276,13 @@ class MainWindow(QMainWindow):
         self._act(e, "Undo", self.undo, "Ctrl+Z")
         self._act(e, "Redo", self.redo, "Ctrl+Shift+Z")
         e.addSeparator()
+        self._act(e, "Cut", self.cut, "Ctrl+X")
+        self._act(e, "Copy", self.copy, "Ctrl+C")
+        self._act(e, "Paste (overwrites at cursor)", self.paste, "Ctrl+V")
+        e.addSeparator()
+        self._act(e, "Selection louder (+1 dB)", lambda: self.gain_selection(1.0), "Shift+Up")
+        self._act(e, "Selection quieter (-1 dB)", lambda: self.gain_selection(-1.0), "Shift+Down")
+        self._act(e, "Change selection level...", self.gain_selection_dialog, "G")
         self._act(e, "Silence selection", self.silence_selection)
         self._act(e, "Fade in selection", lambda: self.fade_selection(True))
         self._act(e, "Fade out selection", lambda: self.fade_selection(False))
@@ -288,6 +295,7 @@ class MainWindow(QMainWindow):
         self._act(t, "Delete selected track", lambda: self._delete(self.state.sel_track))
         a = mb.addMenu("&Audio")
         self._act(a, "Audio settings...", self.audio_settings)
+        self._act(a, "Measure latency...", self.measure_latency)
         self._act(a, "Master effects", self.show_master_fx)
         h = mb.addMenu("&Help")
         self._act(h, "Keyboard shortcuts", lambda: ShortcutsDialog(self).exec(), "F1")
@@ -347,11 +355,11 @@ class MainWindow(QMainWindow):
         in_idx = eng.device_index_by_name(host, "input", in_name)
         out_idx = eng.device_index_by_name(host, "output", out_name)
         self.in_device_name = in_name if in_idx is not None else None
+        self._latency_key = f"{host}|{in_name}|{out_name}|{block}"
+        self.engine.measured_latency_ms = self._measured_map().get(self._latency_key)
         try:
             self.engine.open(in_idx, out_idx, block)
-            self.dev_label.setText(
-                f"In: {self.in_device_name or 'none'}   Out: {out_name}   "
-                f"latency {self.engine.reported_latency_ms():.0f} ms (+{self.engine.manual_latency_ms:.0f})")
+            self._update_dev_label(out_name)
         except Exception as e:  # noqa: BLE001
             self.dev_label.setText("Audio device not open")
             msg = f"Couldn't open the audio device:\n{e}\n\nPick another input/output in Audio settings."
@@ -360,6 +368,35 @@ class MainWindow(QMainWindow):
             else:
                 QMessageBox.warning(self, "Audio", msg)
         self._refresh_input_names()
+
+    def _update_dev_label(self, out_name=None):
+        out_name = out_name or self.settings.value("output", "")
+        e = self.engine
+        how = "measured" if e.measured_latency_ms is not None else "estimated - Audio > Measure latency"
+        extra = f" {e.manual_latency_ms:+.0f}" if e.manual_latency_ms else ""
+        self.dev_label.setText(f"In: {self.in_device_name or 'none'}   Out: {out_name}   "
+                               f"latency {e.base_latency_ms():.1f} ms{extra} ({how})")
+
+    def _measured_map(self) -> dict:
+        try:
+            return json.loads(self.settings.value("measured_latency", "{}") or "{}")
+        except (TypeError, ValueError):
+            return {}
+
+    def measure_latency(self):
+        self.stop_all()
+        if self.engine.stream is None or not self.engine.in_channels:
+            QMessageBox.information(self, "Measure latency", "Open an input and output device first (Audio settings).")
+            return
+        d = LatencyDialog(self, self.engine, self._input_names(), self.engine.base_latency_ms(),
+                          self.engine.measured_latency_ms is not None)
+        if d.exec() and d.result_ms is not None:
+            m = self._measured_map()
+            m[self._latency_key] = round(d.result_ms, 2)
+            self.settings.setValue("measured_latency", json.dumps(m))
+            self.engine.measured_latency_ms = d.result_ms
+            self._update_dev_label()
+            self.status.showMessage(f"Latency set to {d.result_ms:.1f} ms. New takes will line up to that.", 6000)
 
     def _input_names(self) -> list[str]:
         n = self.engine.in_channels
@@ -382,7 +419,7 @@ class MainWindow(QMainWindow):
         d = AudioSettingsDialog(self, host, self.settings.value("input"), self.settings.value("output"),
                                 int(self.settings.value("blocksize", 1024)),
                                 float(self.settings.value("manual_latency_ms", 0.0)),
-                                self.engine.reported_latency_ms())
+                                self.engine.base_latency_ms())
         if d.exec():
             host, inp, out, block, manual = d.values()
             self.settings.setValue("host", host)
@@ -593,6 +630,7 @@ class MainWindow(QMainWindow):
             lane = Lane(t, self.state, self.peaks, self._lane_engine_info)
             lane.pressed.connect(self.select_track)
             lane.context.connect(self._lane_menu)
+            lane.moveRequested.connect(self._move_region)
             h.addWidget(hd)
             h.addWidget(lane, 1)
             self.rows.insertWidget(self.rows.count() - 1, row)
@@ -829,6 +867,9 @@ class MainWindow(QMainWindow):
         lat = self.engine.latency_samples()
         ch = min(t.input_channel, self.engine.in_channels - 1)
         self.rec_track_id = t.id
+        # don't play the track we're recording over, it's distracting
+        self.engine.exclude_track = t.id
+        self.engine.update_mix()
         self.live_peaks = np.zeros(0, np.float32)
         self._live_idx = 0
         self._live_tail = np.zeros(0, np.float32)
@@ -845,7 +886,7 @@ class MainWindow(QMainWindow):
         else:
             sel = self.state.sel
             if sel:
-                start = max(0, sel[0] - int(PREROLL_S * SR))
+                start = sel[0]
                 self.punch = (sel[0], sel[1])
                 stop_at = min(self.project.length, sel[1] + lat)
             else:
@@ -854,7 +895,7 @@ class MainWindow(QMainWindow):
                     start = 0
                 self.punch = (start, None)
                 stop_at = None
-            self.play_origin = self.punch[0] if sel else start
+            self.play_origin = start
             self.engine.record(start, ch, stop_at)
             self._video_start(start)
         self.rec_btn.setChecked(True)
@@ -865,6 +906,8 @@ class MainWindow(QMainWindow):
     def finish_recording(self, cancel=False):
         res = self.engine.stop()
         tid, self.rec_track_id = self.rec_track_id, None
+        self.engine.exclude_track = None
+        self.engine.update_mix()
         self.rec_btn.setStyleSheet("")
         self.play_btn.setText("▶")
         self.state.playhead = None
@@ -886,13 +929,8 @@ class MainWindow(QMainWindow):
             self.status.showMessage("Take too short, ignored", 3000)
         else:
             seg = data[w0 - tl_start: w1 - tl_start].reshape(-1, 1).astype(np.float32)
-            # 5 ms fades at punch edges so there are no clicks
-            f = min(240, len(seg) // 2)
-            if p_out is not None or p_in > 0:
-                seg[:f, 0] *= np.linspace(0, 1, f)
-            if p_out is not None:
-                seg[-f:, 0] *= np.linspace(1, 0, f)
-            self.project.write_region(t, w0, seg, "Record")
+            # 5 ms crossfade with what was there at the punch edges, so there are no clicks
+            self.project.write_region(t, w0, seg, "Record", xfade=240)
             peak = float(np.abs(seg).max())
             msg = f"Recorded {fmt_time(w1 - w0)} on '{t.name}'"
             if peak >= 0.99:
@@ -936,6 +974,77 @@ class MainWindow(QMainWindow):
             self.project.transform_region(t, a, b, fn, "Normalise")
             self._track_audio_changed(t)
 
+    def gain_selection(self, db: float):
+        t, a, b = self._sel_target()
+        if not t:
+            self.status.showMessage("Select part of a track first (click and drag on it)", 3000)
+            return
+        g = 10 ** (db / 20)
+
+        def fn(seg):
+            env = np.full(len(seg), g, np.float32)
+            k = min(240, len(seg) // 2)      # 5 ms ramps so the level change doesn't click
+            env[:k] = np.linspace(1, g, k)
+            env[-k:] = np.linspace(g, 1, k)
+            return seg * env[:, None]
+        self.project.transform_region(t, a, b, fn, f"Level {db:+.1f} dB")
+        self._track_audio_changed(t)
+        pk = float(np.abs(t.audio[a:b]).max()) if t.audio is not None else 0
+        warn = "  (peaks over 0 dB now, the master limiter will catch it)" if pk > 1 else ""
+        self.status.showMessage(f"Selection {db:+.1f} dB{warn}", 2500)
+
+    def gain_selection_dialog(self):
+        t, a, b = self._sel_target()
+        if not t:
+            self.status.showMessage("Select part of a track first (click and drag on it)", 3000)
+            return
+        db, ok = QInputDialog.getDouble(self, "Change level", "Change the selection's level by (dB):",
+                                        3.0, -60.0, 24.0, 1)
+        if ok and db:
+            self.gain_selection(db)
+
+    def copy(self):
+        t, a, b = self._sel_target()
+        if t and t.audio is not None:
+            self.clipboard = t.audio[a:b].copy()
+            self.status.showMessage(f"Copied {(b - a) / SR:.2f} s", 2000)
+
+    def cut(self):
+        t, a, b = self._sel_target()
+        if t and t.audio is not None:
+            self.clipboard = t.audio[a:b].copy()
+            self.project.write_region(t, a, np.zeros_like(self.clipboard), "Cut", xfade=240)
+            self._track_audio_changed(t)
+            self.status.showMessage(f"Cut {(b - a) / SR:.2f} s", 2000)
+
+    def paste(self):
+        t = self.selected_track()
+        clip = getattr(self, "clipboard", None)
+        if t is None or clip is None or self.engine.recording:
+            return
+        at = self.state.sel[0] if self.state.sel else self.state.cursor
+        n = min(len(clip), self.project.length - at)
+        if n <= 0:
+            return
+        self.project.write_region(t, at, clip[:n], "Paste", xfade=240)
+        self.state.sel = (at, at + n)
+        self.state.cursor = at
+        self._track_audio_changed(t)
+        self.status.showMessage(f"Pasted {n / SR:.2f} s onto '{t.name}' (overwrote what was there)", 3000)
+
+    def _move_region(self, tid, a, b, dst, copy):
+        t = self.project.track(tid)
+        if t is None or self.engine.recording:
+            return
+        n = self.project.move_region(t, a, b, dst, copy)
+        if n:
+            self.state.sel = (dst, dst + n)
+            self.state.cursor = dst
+            self._track_audio_changed(t)
+            self.status.showMessage(f"{'Copied' if copy else 'Moved'} {n / SR:.2f} s "
+                                    f"({(dst - a) / SR:+.3f} s). Ctrl+Z to undo", 3000)
+        self.state.changed.emit()
+
     def select_all(self):
         self.state.sel = (0, self.project.length)
         self.state.cursor = 0
@@ -973,7 +1082,11 @@ class MainWindow(QMainWindow):
     def _lane_menu(self, tid, pos):
         m = QMenu(self)
         has_sel = self.state.sel is not None
-        for text, fn in (("Silence selection", self.silence_selection),
+        for text, fn in (("Louder +1 dB  (Shift+Up)", lambda: self.gain_selection(1.0)),
+                         ("Quieter -1 dB  (Shift+Down)", lambda: self.gain_selection(-1.0)),
+                         ("Change level...  (G)", self.gain_selection_dialog),
+                         ("Cut", self.cut), ("Copy", self.copy),
+                         ("Silence selection", self.silence_selection),
                          ("Fade in", lambda: self.fade_selection(True)),
                          ("Fade out", lambda: self.fade_selection(False)),
                          ("Normalise", self.normalize_selection)):

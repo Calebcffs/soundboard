@@ -17,6 +17,20 @@ import soundfile as sf
 SR = 48000
 PROJECT_VERSION = 1
 MAX_UNDO = 40
+XF = 240        # 5 ms crossfade at edit edges
+
+
+def crossfade_edges(old: np.ndarray, new: np.ndarray, k: int) -> np.ndarray:
+    """new, but its first/last k samples fade from/to old (equal-gain), avoiding clicks."""
+    n = len(new)
+    k = min(k, n // 2)
+    if k < 2 or len(old) != n:
+        return new
+    out = new.copy()
+    r = np.linspace(0, 1, k, dtype=np.float32)[:, None]
+    out[:k] = old[:k] * (1 - r) + new[:k] * r
+    out[-k:] = new[-k:] * (1 - r) + old[-k:] * r
+    return out
 
 TRACK_COLORS = ["#f2a541", "#3fc1c9", "#a78bfa", "#f472b6", "#84cc16", "#60a5fa", "#fb7185"]
 
@@ -120,8 +134,9 @@ class Project:
             return np.zeros((self.length, t.channels), np.float32)
         return t.audio
 
-    def write_region(self, t: Track, start: int, data: np.ndarray, label: str):
-        """Overwrite t.audio[start:start+len(data)] with data (copy-on-write, undoable)."""
+    def write_region(self, t: Track, start: int, data: np.ndarray, label: str, xfade: int = 0):
+        """Overwrite t.audio[start:start+len(data)] with data (copy-on-write, undoable).
+        xfade > 0 blends the first/last xfade samples with what was there, so edges don't click."""
         start = max(0, start)
         end = min(self.length, start + len(data))
         if end <= start:
@@ -132,6 +147,8 @@ class Project:
             data = np.repeat(data[:, :1], base.shape[1], axis=1) if data.shape[1] == 1 else data.mean(axis=1, keepdims=True)
         had_audio = t.audio is not None
         old = base[start:end].copy()
+        if xfade:
+            data = crossfade_edges(old, data.astype(np.float32), xfade)
         new = base.copy()
         new[start:end] = data
         t.audio = new
@@ -146,6 +163,24 @@ class Project:
             return
         seg = t.audio[start:end].copy()
         self.write_region(t, start, fn(seg).astype(np.float32), label)
+
+    def move_region(self, t: Track, a: int, b: int, dst: int, copy: bool) -> int:
+        """Move (or copy) [a, b) to start at dst, overwriting what's there. One undo step.
+        Returns the length actually placed."""
+        if t.audio is None:
+            return 0
+        n = min(b - a, self.length - dst)
+        if n <= 0:
+            return 0
+        seg = t.audio[a:a + n].copy()
+        lo, hi = min(a, dst), max(b, dst + n)
+        region = t.audio[lo:hi].copy()
+        if not copy:
+            region[a - lo:b - lo] = crossfade_edges(region[a - lo:b - lo], np.zeros_like(region[a - lo:b - lo]), XF)
+        i = dst - lo
+        region[i:i + n] = crossfade_edges(region[i:i + n], seg, XF)
+        self.write_region(t, lo, region, "Copy" if copy else "Move")
+        return n
 
     def set_offset(self, t: Track, ms: float):
         self._push(("offset", t.id, t.offset_ms, ms, "Nudge track", True))

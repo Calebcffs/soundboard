@@ -9,6 +9,12 @@ import time
 # (often 44.1k if something else is playing). Ask for 48k, like `pw-jack -s 48000` does.
 os.environ.setdefault("PIPEWIRE_RATE", "1/48000")
 os.environ.setdefault("PIPEWIRE_QUANTUM", "1024/48000")
+try:
+    _q, _r = os.environ["PIPEWIRE_QUANTUM"].split("/")
+    QUANTUM_MS = int(_q) / int(_r) * 1000
+except ValueError:
+    QUANTUM_MS = 1024 / 48
+
 
 import numpy as np
 import sounddevice as sd
@@ -78,6 +84,9 @@ class AudioEngine:
         self.in_channels = 0
         self.out_channels = 2
         self.manual_latency_ms = 0.0
+        self.host_name = ""
+        self.measured_latency_ms: float | None = None   # from the click test, if done
+        self.exclude_track: str | None = None           # track being recorded: not played back
         self.error: str | None = None
 
         self.playing = False
@@ -100,6 +109,11 @@ class AudioEngine:
         self._master_gain = 1.0
         self._reset_master = False
 
+        self._cal_sig: np.ndarray | None = None
+        self._cal_pos = 0
+        self._cal_ch = 0
+        self._cal_in: list[np.ndarray] = []
+
     # ---- stream ----
     def open(self, in_dev: int | None, out_dev: int | None, blocksize: int = 1024):
         self.close()
@@ -109,6 +123,7 @@ class AudioEngine:
             if out_dev is None:
                 raise RuntimeError("No output device selected.")
             self.out_channels = min(2, devs[out_dev]["max_output_channels"])
+            self.host_name = sd.query_hostapis(devs[out_dev]["hostapi"])["name"]
             if in_dev is not None:
                 self.in_channels = min(8, devs[in_dev]["max_input_channels"])
                 self.stream = sd.Stream(device=(in_dev, out_dev), samplerate=SR, blocksize=blocksize,
@@ -135,15 +150,44 @@ class AudioEngine:
             self.stream = None
 
     def reported_latency_ms(self) -> float:
+        """Driver-reported round trip plus one PipeWire cycle, which PortAudio's JACK layer
+        leaves out (checked with a loopback: real = reported + 1 quantum at every buffer size)."""
         if self.stream is None:
             return 0.0
         lat = self.stream.latency
-        if isinstance(lat, (tuple, list)):
-            return (lat[0] + lat[1]) * 1000
-        return lat * 2 * 1000
+        parts = list(lat) if isinstance(lat, (tuple, list)) else [lat, lat]
+        block_ms = (self.stream.blocksize or 1024) / SR * 1000
+        # some devices report nonsense (e.g. 89478 s) for one direction; ignore that part
+        rep = sum(x * 1000 for x in parts if 0 <= x < 1.0) or 2 * block_ms
+        if self.host_name.startswith("JACK"):
+            rep += QUANTUM_MS
+        return rep
+
+    def base_latency_ms(self) -> float:
+        """Measured round trip if we have one for this setup, else what the driver reports."""
+        if self.measured_latency_ms is not None:
+            return self.measured_latency_ms
+        return self.reported_latency_ms()
 
     def latency_samples(self) -> int:
-        return int(round((self.reported_latency_ms() + self.manual_latency_ms) * SR / 1000))
+        return int(round((self.base_latency_ms() + self.manual_latency_ms) * SR / 1000))
+
+    # ---- latency calibration: play a signal, capture the input in the same callbacks ----
+    def calibrate_start(self, signal: np.ndarray, channel: int):
+        self.playing = False
+        self._cal_in = []
+        self._cal_ch = channel
+        self._cal_pos = 0
+        self._cal_sig = signal.astype(np.float32)
+
+    def calibrate_done(self) -> bool:
+        return self._cal_sig is None
+
+    def calibrate_result(self) -> np.ndarray:
+        return np.concatenate(self._cal_in) if self._cal_in else np.zeros(0, np.float32)
+
+    def calibrate_cancel(self):
+        self._cal_sig = None
 
     # ---- mix state (called from UI thread; callback reads the swapped references) ----
     def update_mix(self):
@@ -153,7 +197,7 @@ class AudioEngine:
             return
         mix = []
         for t in fxmod.audible(p):
-            if t.processed is not None:
+            if t.processed is not None and t.id != self.exclude_track:
                 gl, gr = fxmod.track_gains(t)
                 mix.append((t.processed, gl, gr))
         self._mix = mix
@@ -202,6 +246,19 @@ class AudioEngine:
         if indata is not None and len(indata):
             self.in_peaks[: indata.shape[1]] = np.abs(indata).max(axis=0)
         outdata.fill(0)
+        sig = self._cal_sig
+        if sig is not None:
+            n = min(frames, len(sig) - self._cal_pos)
+            if n > 0:
+                outdata[:n, 0] = sig[self._cal_pos:self._cal_pos + n]
+                if self.out_channels > 1:
+                    outdata[:n, 1] = outdata[:n, 0]
+            if indata is not None:
+                self._cal_in.append(indata[:, min(self._cal_ch, indata.shape[1] - 1)].copy())
+            self._cal_pos += frames
+            if self._cal_pos >= len(sig):
+                self._cal_sig = None
+            return
         if not self.playing or self.project is None:
             self.out_peak = 0.0
             return
