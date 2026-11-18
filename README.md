@@ -7,6 +7,7 @@ Run it with `./run.sh` or from the app menu ("Overdub").
 ## How it works
 
 - **New project from video**: the video's own audio becomes the "Phone audio" track and an empty "Bass" track gets added (set to Inst / input 2). Projects live in `~/Overdub/<name>/`.
+- **Start from scratch**: no video, just an empty "Bass" track and a timeline length you pick (3:00 by default). Edit > Change length grows or trims it later. Export gives you a WAV of the mix.
 - **Recording**: select a track and press **R**. It overwrites whatever is on that track from the cursor onward, and that track is muted while you record so you don't hear the old take. If you select a range first, R records exactly inside the selection (5 ms crossfades at the edges so there's no click).
 - **Editing a selection**: drag it to move it along the track (Ctrl-drag copies), Shift+Up/Down for +/-1 dB, G for any level change, Ctrl+X/C/V to cut/copy/paste (works across tracks), Delete to silence.
 - **Hearing yourself**: turn on Direct Monitor on the Scarlett. The app plays the backing tracks and shifts each new take back by the round-trip latency so it lines up.

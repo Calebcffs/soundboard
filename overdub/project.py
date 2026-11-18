@@ -115,6 +115,10 @@ class Project:
         return os.path.basename(self.folder.rstrip("/"))
 
     @property
+    def has_video(self) -> bool:
+        return bool(self.video_path)
+
+    @property
     def proxy_path(self) -> str:
         return os.path.join(self.folder, "preview.mp4")
 
@@ -190,6 +194,22 @@ class Project:
         idx = self.tracks.index(t)
         self.tracks.remove(t)
         self._push(("delete", t, idx, "Delete track"))
+
+    def set_length(self, n: int):
+        """Grow or shrink the timeline (only used for projects without a video).
+        Clears undo history, since old edits may point past the new end."""
+        n = max(SR, int(n))
+        for t in self.tracks:
+            if t.audio is not None and len(t.audio) != n:
+                a = t.audio[:n]
+                if len(a) < n:
+                    a = np.pad(a, ((0, n - len(a)), (0, 0)))
+                t.audio = np.ascontiguousarray(a)
+                t.audio_dirty = True
+        self.length = n
+        self.undo_stack.clear()
+        self.redo_stack.clear()
+        self.dirty = True
 
     def _push(self, entry):
         self.undo_stack.append(entry)
@@ -275,7 +295,7 @@ class Project:
     def load(cls, folder: str) -> "Project":
         with open(os.path.join(folder, "project.json")) as f:
             doc = json.load(f)
-        p = cls(folder, doc["video_path"], int(doc["length"]), doc.get("video_info", {}))
+        p = cls(folder, doc.get("video_path") or "", int(doc["length"]), doc.get("video_info", {}))
         p.master_fx = FxSettings.from_dict(doc.get("master_fx", {}))
         p.master_volume_db = doc.get("master_volume_db", 0.0)
         for m in doc["tracks"]:

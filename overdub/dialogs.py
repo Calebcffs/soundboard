@@ -4,7 +4,7 @@ from __future__ import annotations
 import os
 
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import (QDialog, QFormLayout, QComboBox, QDoubleSpinBox, QDialogButtonBox,
+from PySide6.QtWidgets import (QDialog, QFormLayout, QComboBox, QDoubleSpinBox, QDialogButtonBox, QSpinBox,
                                QLabel, QVBoxLayout, QHBoxLayout, QLineEdit, QPushButton, QFileDialog,
                                QRadioButton, QCheckBox, QButtonGroup)
 
@@ -69,6 +69,68 @@ class AudioSettingsDialog(QDialog):
     def values(self):
         return (self.host.currentText(), self.inp.currentData(), self.out.currentData(),
                 self.block.currentData(), self.manual.value())
+
+
+class LengthEdit(QHBoxLayout):
+    """Minutes + seconds spin boxes."""
+
+    def __init__(self, seconds: int):
+        super().__init__()
+        self.m = QSpinBox()
+        self.m.setRange(0, 60)
+        self.m.setSuffix(" min")
+        self.s = QSpinBox()
+        self.s.setRange(0, 59)
+        self.s.setSuffix(" s")
+        self.m.setValue(seconds // 60)
+        self.s.setValue(seconds % 60)
+        self.addWidget(self.m)
+        self.addWidget(self.s)
+        self.addStretch(1)
+
+    def seconds(self) -> int:
+        return max(1, self.m.value() * 60 + self.s.value())
+
+
+class ScratchDialog(QDialog):
+    """New project with no video: just a name and how long the timeline is."""
+
+    def __init__(self, parent, default_name: str):
+        super().__init__(parent)
+        self.setWindowTitle("New project from scratch")
+        self.setMinimumWidth(420)
+        form = QFormLayout(self)
+        self.name = QLineEdit(default_name)
+        self.length = LengthEdit(180)
+        form.addRow("Project name", self.name)
+        form.addRow("Length", self.length)
+        hint = QLabel("No video, just tracks. You can change the length later "
+                      "(Edit &gt; Change length), and export the mix as a WAV.")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color:#7b8091")
+        form.addRow(hint)
+        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        bb.button(QDialogButtonBox.Ok).setText("Create")
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        form.addRow(bb)
+
+
+class LengthDialog(QDialog):
+    def __init__(self, parent, seconds: int):
+        super().__init__(parent)
+        self.setWindowTitle("Change length")
+        form = QFormLayout(self)
+        self.length = LengthEdit(seconds)
+        form.addRow("Length", self.length)
+        hint = QLabel("Making it shorter cuts off anything past the new end. This clears undo history.")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color:#7b8091")
+        form.addRow(hint)
+        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        form.addRow(bb)
 
 
 class ExportDialog(QDialog):

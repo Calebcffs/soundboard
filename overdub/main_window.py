@@ -21,7 +21,8 @@ from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, Q
 
 from . import engine as eng
 from . import media
-from .dialogs import AudioSettingsDialog, ExportDialog, ShortcutsDialog, LatencyDialog
+from .dialogs import (AudioSettingsDialog, ExportDialog, ShortcutsDialog, LatencyDialog, ScratchDialog,
+                      LengthDialog)
 from .fx import render_mix
 from .fx_panel import FxPanel
 from .project import SR, Project, Track, TRACK_COLORS
@@ -106,6 +107,7 @@ class MainWindow(QMainWindow):
         self.fx_panel.changed.connect(self._on_fx_changed)
         top.addWidget(self.fx_panel)
         vbox = QWidget()
+        self.video_box = vbox
         vl = QVBoxLayout(vbox)
         vl.setContentsMargins(6, 6, 6, 6)
         self.video = QVideoWidget()
@@ -139,15 +141,17 @@ class MainWindow(QMainWindow):
         box = QVBoxLayout()
         title = QLabel("Overdub")
         title.setStyleSheet("font-size:42px;font-weight:700;color:#e8eaf0")
-        sub = QLabel("Pick a video from your phone, record parts over it, mix, export.")
+        sub = QLabel("Pick a video from your phone (or start from nothing), record parts over it, mix, export.")
         sub.setStyleSheet("color:#9aa0b0;font-size:14px")
         b1 = QPushButton("New project from video...")
+        b3 = QPushButton("Start from scratch (no video)...")
         b2 = QPushButton("Open project...")
-        for b in (b1, b2):
+        for b in (b1, b3, b2):
             b.setMinimumHeight(40)
             b.setStyleSheet("font-size:14px")
         b1.clicked.connect(self.new_project)
         b2.clicked.connect(self.open_project_dialog)
+        b3.clicked.connect(self.new_scratch_project)
         self.recent = QListWidget()
         self.recent.setMaximumHeight(200)
         self.recent.itemActivated.connect(lambda it: self.load_project_folder(it.data(Qt.UserRole)))
@@ -155,6 +159,7 @@ class MainWindow(QMainWindow):
             box.addWidget(x, 0, Qt.AlignHCenter)
         box.addSpacing(20)
         box.addWidget(b1)
+        box.addWidget(b3)
         box.addWidget(b2)
         box.addSpacing(16)
         self.recent_label = QLabel("Recent projects")
@@ -215,6 +220,7 @@ class MainWindow(QMainWindow):
         btn("Audio...", "Input/output devices and latency", self.audio_settings)
         exp = btn("Export video", "Export the video with your mix (Ctrl+E)", self.export, name="exportBtn")
         exp.setMinimumWidth(110)
+        self.export_btn = exp
         return bar
 
     def _build_timeline(self) -> QWidget:
@@ -264,6 +270,7 @@ class MainWindow(QMainWindow):
         mb = self.menuBar()
         f = mb.addMenu("&File")
         self._act(f, "New project from video...", self.new_project, "Ctrl+N")
+        self._act(f, "New project from scratch...", self.new_scratch_project, "Ctrl+Shift+N")
         self._act(f, "Open project...", self.open_project_dialog, "Ctrl+O")
         self._act(f, "Save", self.save, "Ctrl+S")
         f.addSeparator()
@@ -287,6 +294,9 @@ class MainWindow(QMainWindow):
         self._act(e, "Fade in selection", lambda: self.fade_selection(True))
         self._act(e, "Fade out selection", lambda: self.fade_selection(False))
         self._act(e, "Normalise selection", self.normalize_selection)
+        e.addSeparator()
+        self.length_act = self._act(e, "Change length...", self.change_length)
+        self.length_act.setEnabled(False)
         t = mb.addMenu("&Track")
         self._act(t, "Add track", lambda: self.add_track(), "Ctrl+T")
         self._act(t, "Add bass track (input 2)", lambda: self.add_track("Bass", 1))
@@ -465,12 +475,7 @@ class MainWindow(QMainWindow):
         name, ok = QInputDialog.getText(self, "New project", "Project name:", text=stem)
         if not ok or not name.strip():
             return
-        os.makedirs(PROJECTS_DIR, exist_ok=True)
-        folder = os.path.join(PROJECTS_DIR, name.strip())
-        n = 2
-        while os.path.exists(folder):
-            folder = os.path.join(PROJECTS_DIR, f"{name.strip()} {n}")
-            n += 1
+        folder = self._new_folder(name)
         self.stop_all()
         length = int(round(info["duration"] * SR))
         dlg = QProgressDialog("Reading the video's audio...", None, 0, 0, self)
@@ -499,6 +504,62 @@ class MainWindow(QMainWindow):
 
         self._run(job, done, failed)
 
+    def _new_folder(self, name: str) -> str:
+        """~/Overdub/<name>, or <name> 2, <name> 3... if taken. Not created yet."""
+        name = re.sub(r"[/\\]+", "_", name.strip())
+        os.makedirs(PROJECTS_DIR, exist_ok=True)
+        folder = os.path.join(PROJECTS_DIR, name)
+        n = 2
+        while os.path.exists(folder):
+            folder = os.path.join(PROJECTS_DIR, f"{name} {n}")
+            n += 1
+        return folder
+
+    def new_scratch_project(self):
+        d = ScratchDialog(self, f"Song {time.strftime('%Y-%m-%d')}")
+        if not d.exec() or not d.name.text().strip():
+            return
+        folder = self._new_folder(d.name.text())
+        self.stop_all()
+        try:
+            os.makedirs(folder)
+            p = Project(folder, "", d.length.seconds() * SR, {})
+            p.tracks.append(Track(name="Bass", input_channel=1 if self.engine.in_channels >= 2 else 0,
+                                  color=p.next_color()))
+            p.save()
+        except Exception as e:  # noqa: BLE001
+            QMessageBox.warning(self, "Couldn't create project", str(e))
+            return
+        self._load(p)
+
+    def change_length(self):
+        p = self.project
+        if not p or p.has_video:
+            return
+        d = LengthDialog(self, round(p.length / SR))
+        if not d.exec():
+            return
+        n = d.length.seconds() * SR
+        if n == p.length:
+            return
+        if n < p.length and any(t.audio is not None and np.abs(t.audio[n:]).max(initial=0) > 1e-4
+                                for t in p.tracks):
+            if QMessageBox.question(self, "Change length",
+                                    f"There's audio after {fmt_time(n)} that will be cut off. Carry on?"
+                                    ) != QMessageBox.Yes:
+                return
+        self.stop_all()
+        p.set_length(n)
+        self.state.length = n
+        self.state.cursor = min(self.state.cursor, n)
+        self.state.sel = None
+        for t in p.tracks:
+            self.renderer.request(t, 0)
+        self._fit_view()
+        self.state.changed.emit()
+        self.save()
+        self.status.showMessage(f"Length is now {fmt_time(n)} (undo history cleared)", 5000)
+
     def open_project_dialog(self):
         path, _ = QFileDialog.getOpenFileName(self, "Open project", PROJECTS_DIR, "Overdub project (project.json)")
         if path:
@@ -511,7 +572,7 @@ class MainWindow(QMainWindow):
         except Exception as e:  # noqa: BLE001
             QMessageBox.warning(self, "Couldn't open project", str(e))
             return
-        if not os.path.exists(p.video_path):
+        if p.has_video and not os.path.exists(p.video_path):
             QMessageBox.information(self, "Video moved?",
                                     f"The original video isn't at\n{p.video_path}\nanymore. Please find it.")
             path, _ = QFileDialog.getOpenFileName(self, "Find the video", os.path.expanduser("~"), VIDEO_EXTS)
@@ -544,9 +605,15 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(50, self._fit_view)
         self.player.stop()
         self.player.setSource(QUrl())
-        if os.path.exists(p.proxy_path):
+        self.video_box.setVisible(p.has_video)
+        self.video_msg.setText("")
+        self.length_act.setEnabled(not p.has_video)
+        self.export_btn.setText("Export video" if p.has_video else "Export WAV")
+        self.export_btn.setToolTip("Export the video with your mix (Ctrl+E)" if p.has_video
+                                   else "Export the mix as a WAV file (Ctrl+E)")
+        if p.has_video and os.path.exists(p.proxy_path):
             self._set_video(p.proxy_path)
-        elif os.path.exists(p.video_path):
+        elif p.has_video and os.path.exists(p.video_path):
             self._build_proxy(p)
         if p.dirty:
             self.save()
@@ -1103,6 +1170,9 @@ class MainWindow(QMainWindow):
     # ================================================================ export
     def export(self):
         if not self.project:
+            return
+        if not self.project.has_video:
+            self.export_wav()
             return
         self.stop_all()
         p = self.project
